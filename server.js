@@ -5,21 +5,26 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Connect to PostgreSQL (Railway sets DATABASE_URL automatically)
+// Railway Postgres
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
-// Allow large JSON bodies (for base64 images)
+// Allow large JSON (images)
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Serve the frontend
+// Serve frontend
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ===================== DATABASE SETUP =====================
+// Create table
 async function initDB() {
+  if (!process.env.DATABASE_URL) {
+    console.error('❌ DATABASE_URL is missing! Add a PostgreSQL plugin on Railway and link it.');
+    return;
+  }
+
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS products (
@@ -36,95 +41,171 @@ async function initDB() {
       )
     `);
 
-    // Insert sample products if table is empty
     const count = await pool.query('SELECT COUNT(*) FROM products');
-    if (parseInt(count.rows[0].count) === 0) {
+    if (parseInt(count.rows[0].count, 10) === 0) {
       const samples = [
-        ['Heineken Beer (Carton)', 'Premium imported lager beer. 24 bottles per carton.', 18000, 'beer', 'Per Carton', '50 Cartons', true],
-        ['Coca-Cola 50cl (Crate)', 'Classic Coca-Cola PET bottles. 24 pieces per crate.', 4500, 'softdrink', 'Per Crate', '100 Crates', true],
-        ['Hennessy VS Cognac', 'Hennessy Very Special Cognac. 70cl bottle.', 28000, 'wine', 'Per Bottle', '12 Bottles', true],
-        ['Chi Exotic Juice (Pack)', 'Tropical fruit juice blend. 1L x 12 pack.', 6500, 'juice', 'Per Pack', '50 Packs', true],
-        ['Red Bull Energy (Tray)', 'Red Bull 250ml x 24 cans per tray.', 14000, 'energy', 'Per Tray', '30 Trays', true],
-        ['Eva Water (Pack)', 'Premium table water. 75cl x 12 per pack.', 2200, 'water', 'Per Pack', '200 Packs', true],
-        ['Guinness Foreign Extra (Carton)', 'Bold Nigerian stout. 60cl x 12 bottles.', 8500, 'beer', 'Per Carton', '80 Cartons', false],
-        ['Fanta Orange 50cl (Crate)', 'Refreshing orange soft drink. 24 bottles.', 4500, 'softdrink', 'Per Crate', '100 Crates', true],
-        ['Jack Daniels Whiskey', 'Tennessee whiskey. 70cl bottle.', 22000, 'wine', 'Per Bottle', '6 Bottles', true],
-        ['Star Lager Beer (Crate)', 'Nigerian favourite. 60cl x 12 bottles.', 5800, 'beer', 'Per Crate', '100 Crates', true],
-        ['Five Alive Juice (Pack)', 'Citrus burst juice. 1L x 12 per pack.', 7000, 'juice', 'Per Pack', '60 Packs', true],
-        ['Hollandia Yoghurt (Carton)', 'Creamy strawberry yoghurt. 500ml x 12.', 7200, 'other', 'Per Carton', '40 Cartons', true]
+        ['Heineken Beer (Carton)', 'Premium lager. 24 bottles.', 18000, 'beer', 'Per Carton', true],
+        ['Coca-Cola 50cl (Crate)', '24 PET bottles per crate.', 4500, 'softdrink', 'Per Crate', true],
+        ['Hennessy VS Cognac', '70cl original sealed.', 28000, 'wine', 'Per Bottle', true],
+        ['Chi Exotic Juice (Pack)', '1L x 12 pack.', 6500, 'juice', 'Per Pack', true],
+        ['Eva Water (Pack)', '75cl x 12 bottles.', 2200, 'water', 'Per Pack', true],
+        ['Star Lager (Crate)', '60cl x 12 bottles.', 5800, 'beer', 'Per Crate', true]
       ];
-
       for (const s of samples) {
         await pool.query(
-          'INSERT INTO products (name, description, price, category, unit, min_order, available) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+          `INSERT INTO products (name, description, price, category, unit, available)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
           s
         );
       }
       console.log('✅ Sample products inserted');
     }
 
-    console.log('✅ Database initialized');
+    console.log('✅ Database ready');
   } catch (err) {
-    console.error('❌ Database error:', err.message);
+    console.error('❌ DB init error:', err.message);
   }
 }
 
-// ===================== API ROUTES =====================
-
-// Get all products
+// GET all
 app.get('/api/products', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM products ORDER BY created_at DESC');
+    const result = await pool.query('SELECT * FROM products ORDER BY id DESC');
     res.json(result.rows);
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Add new product
+// CREATE
 app.post('/api/products', async (req, res) => {
   try {
-    const { name, description, price, category, unit, min_order, available, image } = req.body;
+    const {
+      name,
+      description = '',
+      price,
+      category = 'other',
+      unit = '',
+      min_order = '',
+      available = true,
+      image = ''
+    } = req.body;
+
+    if (!name || price === undefined || price === null || price === '') {
+      return res.status(400).json({ error: 'Name and price are required' });
+    }
+
+    // Block accidental non-image strings
+    let img = '';
+    if (typeof image === 'string' && image.startsWith('data:image')) {
+      // Optional safety: reject very huge images (~> 8MB base64)
+      if (image.length > 8_000_000) {
+        return res.status(400).json({
+          error: 'Image too large. Use a smaller photo (under ~2MB).'
+        });
+      }
+      img = image;
+    }
+
     const result = await pool.query(
-      `INSERT INTO products (name, description, price, category, unit, min_order, available, image)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-      [name, description || '', price, category || 'other', unit || '', min_order || '', available !== false, image || '']
+      `INSERT INTO products
+        (name, description, price, category, unit, min_order, available, image)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING *`,
+      [
+        String(name).trim(),
+        String(description || ''),
+        Number(price),
+        category || 'other',
+        unit || '',
+        min_order || '',
+        available === true || available === 'true',
+        img
+      ]
     );
-    res.json(result.rows[0]);
+
+    res.status(201).json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('POST /api/products error:', err);
+    res.status(500).json({ error: err.message || 'Server save failed' });
   }
 });
 
-// Update product
+// UPDATE
 app.put('/api/products/:id', async (req, res) => {
   try {
-    const { name, description, price, category, unit, min_order, available, image } = req.body;
+    const {
+      name,
+      description = '',
+      price,
+      category = 'other',
+      unit = '',
+      min_order = '',
+      available = true,
+      image = ''
+    } = req.body;
+
+    if (!name || price === undefined || price === null || price === '') {
+      return res.status(400).json({ error: 'Name and price are required' });
+    }
+
+    let img = '';
+    if (typeof image === 'string' && image.startsWith('data:image')) {
+      if (image.length > 8_000_000) {
+        return res.status(400).json({
+          error: 'Image too large. Use a smaller photo (under ~2MB).'
+        });
+      }
+      img = image;
+    }
+
     const result = await pool.query(
-      `UPDATE products SET name=$1, description=$2, price=$3, category=$4,
-       unit=$5, min_order=$6, available=$7, image=$8 WHERE id=$9 RETURNING *`,
-      [name, description || '', price, category || 'other', unit || '', min_order || '', available !== false, image || '', req.params.id]
+      `UPDATE products SET
+        name=$1, description=$2, price=$3, category=$4,
+        unit=$5, min_order=$6, available=$7, image=$8
+       WHERE id=$9
+       RETURNING *`,
+      [
+        String(name).trim(),
+        String(description || ''),
+        Number(price),
+        category || 'other',
+        unit || '',
+        min_order || '',
+        available === true || available === 'true',
+        img,
+        req.params.id
+      ]
     );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+
     res.json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('PUT /api/products error:', err);
+    res.status(500).json({ error: err.message || 'Server update failed' });
   }
 });
 
-// Toggle availability
+// TOGGLE stock
 app.patch('/api/products/:id/toggle', async (req, res) => {
   try {
     const result = await pool.query(
-      'UPDATE products SET available = NOT available WHERE id=$1 RETURNING *',
+      `UPDATE products SET available = NOT available
+       WHERE id=$1 RETURNING *`,
       [req.params.id]
     );
+    if (!result.rows[0]) return res.status(404).json({ error: 'Not found' });
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Delete product
+// DELETE
 app.delete('/api/products/:id', async (req, res) => {
   try {
     await pool.query('DELETE FROM products WHERE id=$1', [req.params.id]);
@@ -134,9 +215,28 @@ app.delete('/api/products/:id', async (req, res) => {
   }
 });
 
-// ===================== START SERVER =====================
+// Health check
+app.get('/api/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({
+      ok: true,
+      database: !!process.env.DATABASE_URL
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err.message,
+      database: !!process.env.DATABASE_URL
+    });
+  }
+});
+
+// SPA fallback
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
 initDB().then(() => {
-  app.listen(PORT, () => {
-    console.log(`🚀 3MK Depot running on port ${PORT}`);
-  });
+  app.listen(PORT, () => console.log(`🚀 3MK Depot on port ${PORT}`));
 });
